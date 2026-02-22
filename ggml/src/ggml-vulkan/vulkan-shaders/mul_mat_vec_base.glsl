@@ -140,8 +140,9 @@ void reduce_result(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offs
         }
     }
 
-    // Go through shared memory to sum partials across subgroups
-    if (gl_SubgroupInvocationID == 0) {
+    // Cross-subgroup reduction via shared memory + subgroupAdd.
+    // Phase 1: each subgroup leader writes its partial sum.
+    if (subgroupElect()) {
         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
             [[unroll]] for (uint n = 0; n < num_rows; ++n) {
                 tmpsh[j][n][gl_SubgroupID] = temp[j][n];
@@ -149,34 +150,41 @@ void reduce_result(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offs
         }
     }
     barrier();
-    if (tid == 0) {
+    // Phase 2: first subgroup loads all partials and reduces with subgroupAdd.
+    if (gl_SubgroupID == 0u) {
         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
             [[unroll]] for (uint n = 0; n < num_rows; ++n) {
-                temp[j][n] = FLOAT_TYPE(0);
-                [[unroll]] for (uint s = 0; s < gl_NumSubgroups; ++s) {
-                    temp[j][n] += tmpsh[j][n][s];
-                }
+                temp[j][n] = (gl_SubgroupInvocationID < gl_NumSubgroups)
+                    ? tmpsh[j][n][gl_SubgroupInvocationID]
+                    : FLOAT_TYPE(0);
+                temp[j][n] = subgroupAdd(temp[j][n]);
+            }
+        }
+        if (gl_SubgroupInvocationID == 0u) {
+            [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                [[unroll]] for (uint n = 0; n < num_rows; ++n) {
 #ifdef MUL_MAT_ID
-                if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS0) != 0) {
-                    temp[j][n] += FLOAT_TYPE(data_fuse0[expert_id*p.stride_d + first_row + n]);
-                }
-                if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE0) != 0) {
-                    const uint expert_i0 = gl_GlobalInvocationID.y;
-                    temp[j][n] *= FLOAT_TYPE(data_fuse0[expert_i0]);
-                }
-                if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE1) != 0) {
-                    const uint expert_i0 = gl_GlobalInvocationID.y;
-                    temp[j][n] *= FLOAT_TYPE(data_fuse1[expert_i0]);
-                }
+                    if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS0) != 0) {
+                        temp[j][n] += FLOAT_TYPE(data_fuse0[expert_id*p.stride_d + first_row + n]);
+                    }
+                    if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE0) != 0) {
+                        const uint expert_i0 = gl_GlobalInvocationID.y;
+                        temp[j][n] *= FLOAT_TYPE(data_fuse0[expert_i0]);
+                    }
+                    if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE1) != 0) {
+                        const uint expert_i0 = gl_GlobalInvocationID.y;
+                        temp[j][n] *= FLOAT_TYPE(data_fuse1[expert_i0]);
+                    }
 #else
-                if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS0) != 0) {
-                    temp[j][n] += FLOAT_TYPE(data_fuse0[j*p.batch_stride_d + d_offset + first_row + n]);
-                }
-                if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS1) != 0) {
-                    temp[j][n] += FLOAT_TYPE(data_fuse1[j*p.batch_stride_d + d_offset + first_row + n]);
-                }
+                    if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS0) != 0) {
+                        temp[j][n] += FLOAT_TYPE(data_fuse0[j*p.batch_stride_d + d_offset + first_row + n]);
+                    }
+                    if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS1) != 0) {
+                        temp[j][n] += FLOAT_TYPE(data_fuse1[j*p.batch_stride_d + d_offset + first_row + n]);
+                    }
 #endif
-                data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(temp[j][n]);
+                    data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(temp[j][n]);
+                }
             }
         }
     }

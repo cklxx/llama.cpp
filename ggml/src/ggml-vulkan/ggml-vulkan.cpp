@@ -2904,11 +2904,15 @@ static const std::unordered_map<std::string, uint32_t> rdna1_pipelines = {
 // Pipeline configuration for RDNA2 GPUs.
 static const std::unordered_map<std::string, uint32_t> rdna2_pipelines = {
     {"soft_max", 64}, {"im2col", 64},
+    {"argmax", 64},
 };
 
 // Pipeline configuration for RDNA3 GPUs.
+// Reduction-heavy shaders benefit from wave64: wider subgroupAdd covers more
+// lanes per intrinsic, fewer cross-subgroup partials, and better ALU packing.
 static const std::unordered_map<std::string, uint32_t> rdna3_pipelines = {
     {"soft_max", 64}, {"im2col", 64},
+    {"argmax", 64}, {"sum_rows", 64}, {"count_equal", 64},
 };
 
 static constexpr uint32_t RDNA_DEFAULT_SUBGROUP_SIZE = 32;

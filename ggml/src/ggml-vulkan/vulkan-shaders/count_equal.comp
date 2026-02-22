@@ -1,6 +1,8 @@
 #version 450
 
 #extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
 
 #include "types.glsl"
 #include "generic_head.glsl"
@@ -27,5 +29,10 @@ void main() {
         count += uint(data_a[idx] == data_b[idx]);
     }
 
-    atomicAdd(data_d[0], D_TYPE(count));
+    // Reduce within subgroup first to minimize atomic contention.
+    // Only the elected lane per subgroup issues the atomic.
+    count = subgroupAdd(count);
+    if (subgroupElect()) {
+        atomicAdd(data_d[0], D_TYPE(count));
+    }
 }
