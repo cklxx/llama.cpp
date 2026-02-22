@@ -2,6 +2,8 @@
 
 #extension GL_EXT_control_flow_attributes : enable
 #extension GL_EXT_shader_16bit_storage : require
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
 
 #define BLOCK_SIZE 32
 #define FLOAT_TYPE float
@@ -26,8 +28,6 @@ layout (push_constant) uniform parameter
     uint nb23;
     uint fusion_flags;
 } p;
-
-shared FLOAT_TYPE tmp[BLOCK_SIZE];
 
 void main() {
     const uint tid       = gl_LocalInvocationID.x;
@@ -101,24 +101,16 @@ void main() {
         }
     }
 
-    tmp[tid] = temp;
-
-    // sum up partial sums and write back result
-    barrier();
-    [[unroll]] for (int s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            tmp[tid] += tmp[tid + s];
-        }
-        barrier();
-    }
+    // Subgroup-accelerated reduction (BLOCK_SIZE == 32, single subgroup)
+    temp = subgroupAdd(temp);
 
     if (tid == 0) {
         if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS0) != 0) {
-            tmp[0] += FLOAT_TYPE(data_fuse0[idst]);
+            temp += FLOAT_TYPE(data_fuse0[idst]);
         }
         if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS1) != 0) {
-            tmp[0] += FLOAT_TYPE(data_fuse1[idst]);
+            temp += FLOAT_TYPE(data_fuse1[idst]);
         }
-        data_d[idst] = tmp[0];
+        data_d[idst] = temp;
     }
 }

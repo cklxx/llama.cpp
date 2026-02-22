@@ -4,6 +4,8 @@
 #include "sum_rows.glsl"
 
 #extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
 
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
@@ -13,6 +15,8 @@ layout (binding = 1) writeonly buffer D {D_TYPE data_d[];};
 layout (constant_id = 0) const uint BLOCK_SIZE = 32;
 
 shared FLOAT_TYPE tmp[BLOCK_SIZE];
+
+#include "subgroup_reduce.glsl"
 
 void main() {
     const uint row = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
@@ -27,21 +31,16 @@ void main() {
     const uint src_idx = get_aoffset() + i01 * p.nb01 + i02 * p.nb02 + i03 * p.nb03;
     const uint dst_idx = get_doffset() + i01 * p.nb11 + i02 * p.nb12 + i03 * p.nb13;
 
-    tmp[col] = FLOAT_TYPE(0.0);
+    FLOAT_TYPE partial = FLOAT_TYPE(0.0);
 
     for (uint i = col; i < p.n_cols; i += BLOCK_SIZE) {
-        tmp[col] += FLOAT_TYPE(data_a[src_idx + i]);
+        partial += FLOAT_TYPE(data_a[src_idx + i]);
     }
 
-    barrier();
-    [[unroll]] for (int s = int(BLOCK_SIZE) / 2; s > 0; s >>= 1) {
-        if (col < s) {
-            tmp[col] += tmp[col + s];
-        }
-        barrier();
-    }
+    // Subgroup-accelerated reduction (2 barriers vs log2(BLOCK_SIZE)+1)
+    SUBGROUP_REDUCE_ADD(partial, tmp);
 
     if (col == 0) {
-        data_d[dst_idx] = D_TYPE(tmp[0] * weight);
+        data_d[dst_idx] = D_TYPE(partial * weight);
     }
 }

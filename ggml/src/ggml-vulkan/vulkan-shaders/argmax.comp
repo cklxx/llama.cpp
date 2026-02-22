@@ -4,6 +4,9 @@
 #include "types.glsl"
 
 #extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_ballot : enable
 
 #define FLT_MAX 3.402823466e+38F
 
@@ -25,34 +28,51 @@ void main() {
         return;
     }
 
-    A_TYPE amax = -FLT_MAX;
+    FLOAT_TYPE amax = FLOAT_TYPE(-FLT_MAX);
     uint acol = col;
 
     if (col < p.KX) {
-        amax = data_a[row*p.KX + col];
+        amax = FLOAT_TYPE(data_a[row*p.KX + col]);
     }
 
     for (uint i = col + BLOCK_SIZE; i < p.KX; i += BLOCK_SIZE) {
-        A_TYPE val = data_a[row*p.KX + i];
+        FLOAT_TYPE val = FLOAT_TYPE(data_a[row*p.KX + i]);
         if (val > amax) {
             amax = val;
             acol = i;
         }
     }
 
-    tmp[col] = acol;
-    tmpmax[col] = amax;
+    // Subgroup-accelerated argmax reduction (2 barriers vs log2(BLOCK_SIZE)+1)
+    // Step 1: intra-subgroup reduction using subgroupMax + ballot
+    FLOAT_TYPE sg_max = subgroupMax(amax);
+    uvec4 ballot = subgroupBallot(amax == sg_max);
+    uint winner = subgroupBallotFindLSB(ballot);
+    acol = subgroupBroadcast(acol, winner);
 
-    barrier();
-    [[unroll]] for (int s = int(BLOCK_SIZE) / 2; s > 0; s >>= 1) {
-        if (col < s && col + s < p.KX) {
-            if (tmpmax[col] < tmpmax[col + s]) {
-                tmpmax[col] = tmpmax[col + s];
-                tmp[col] = tmp[col + s];
-            }
-        }
-        barrier();
+    // Step 2: cross-subgroup reduction via shared memory
+    if (subgroupElect()) {
+        tmpmax[gl_SubgroupID] = sg_max;
+        tmp[gl_SubgroupID] = acol;
     }
+    barrier();
+
+    if (gl_SubgroupID == 0u) {
+        FLOAT_TYPE val = (gl_SubgroupInvocationID < gl_NumSubgroups)
+            ? tmpmax[gl_SubgroupInvocationID] : FLOAT_TYPE(-FLT_MAX);
+        uint idx = (gl_SubgroupInvocationID < gl_NumSubgroups)
+            ? tmp[gl_SubgroupInvocationID] : 0u;
+
+        FLOAT_TYPE max_val = subgroupMax(val);
+        uvec4 ballot2 = subgroupBallot(val == max_val);
+        uint winner2 = subgroupBallotFindLSB(ballot2);
+        idx = subgroupBroadcast(idx, winner2);
+
+        if (gl_SubgroupInvocationID == 0u) {
+            tmp[0] = idx;
+        }
+    }
+    barrier();
 
     if (col == 0) {
         data_d[row] = D_TYPE(tmp[0]);
