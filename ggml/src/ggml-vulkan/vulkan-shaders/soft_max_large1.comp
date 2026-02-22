@@ -45,18 +45,10 @@ void main() {
         }
     }
 
-    // reduce across the workgroup
-    vals[tid] = max_val;
-    barrier();
-    [[unroll]] for (uint s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            vals[tid] = max(vals[tid], vals[tid + s]);
-        }
-        barrier();
-    }
+    // reduce max across the workgroup using subgroup ops
+    SUBGROUP_REDUCE_MAX(max_val, vals);
 
     if (tid == 0) {
-        max_val = vals[0];
         data_m[rowx * gl_NumWorkGroups.x + gl_WorkGroupID.x] = max_val;
     }
 }

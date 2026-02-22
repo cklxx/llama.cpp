@@ -1,6 +1,8 @@
 #version 450
 
 #extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
 
 #include "generic_head.glsl"
 #include "types.glsl"
@@ -16,6 +18,8 @@ layout (binding = 2) buffer D {D_TYPE data_d[];};
 
 shared FLOAT_TYPE sum_yg[BLOCK_SIZE];
 
+#include "subgroup_reduce.glsl"
+
 void main() {
     const uint row = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
     const uint tid = gl_LocalInvocationID.x;
@@ -26,25 +30,17 @@ void main() {
 
     FLOAT_TYPE scale = p.param1;
 
-    // partial sums for thread in warp
-    sum_yg[tid] = FLOAT_TYPE(0.0f);
+    FLOAT_TYPE partial = FLOAT_TYPE(0.0f);
 
     [[unroll]] for (uint col = tid; col < p.KX; col += BLOCK_SIZE) {
         const FLOAT_TYPE gi = FLOAT_TYPE(data_g[row*p.KX + col]);
         const FLOAT_TYPE yi = FLOAT_TYPE(data_y[row*p.KX + col]);
-        sum_yg[tid] += yi * gi;
+        partial += yi * gi;
     }
 
-    // sum up partial sums and write back result
-    barrier();
-    [[unroll]] for (uint s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            sum_yg[tid] += sum_yg[tid + s];
-        }
-        barrier();
-    }
-
-    const FLOAT_TYPE dot_yg = sum_yg[0];
+    // Subgroup-accelerated reduction (2 barriers vs log2(N)+1)
+    SUBGROUP_REDUCE_ADD(partial, sum_yg);
+    const FLOAT_TYPE dot_yg = partial;
 
     [[unroll]] for (uint col = tid; col < p.KX; col += BLOCK_SIZE) {
         data_d[row*p.KX + col] = D_TYPE(scale

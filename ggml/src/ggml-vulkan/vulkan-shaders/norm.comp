@@ -4,6 +4,8 @@
 #include "types.glsl"
 
 #extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
 #define BLOCK_SIZE 512
 
 layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
@@ -17,22 +19,34 @@ void main() {
     const uint row = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
     const uint tid = gl_LocalInvocationID.x;
 
-    sum[tid] = vec2(0.0f, 0.0f);
+    float sum_x = 0.0f;
+    float sum_x2 = 0.0f;
 
     [[unroll]] for (uint col = tid; col < p.KX; col += BLOCK_SIZE) {
         const float xi = float(data_a[row*p.KX + col]);
-        sum[tid].x += xi;
-        sum[tid].y += xi * xi;
+        sum_x += xi;
+        sum_x2 += xi * xi;
     }
 
-    // sum up partial sums and write back result
-    barrier();
-    [[unroll]] for (int s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            sum[tid] += sum[tid + s];
-        }
-        barrier();
+    // Subgroup-accelerated reduction for both components (2 barriers vs 10)
+    sum_x = subgroupAdd(sum_x);
+    sum_x2 = subgroupAdd(sum_x2);
+
+    if (subgroupElect()) {
+        sum[gl_SubgroupID] = vec2(sum_x, sum_x2);
     }
+    barrier();
+
+    const uint num_subgroups = gl_NumSubgroups;
+    if (gl_SubgroupID == 0) {
+        vec2 v = (gl_SubgroupInvocationID < num_subgroups)
+               ? sum[gl_SubgroupInvocationID]
+               : vec2(0.0f);
+        v.x = subgroupAdd(v.x);
+        v.y = subgroupAdd(v.y);
+        sum[0] = v;
+    }
+    barrier();
 
     const float mean = sum[0].x / p.KX;
     const float var = sum[0].y / p.KX - mean * mean;

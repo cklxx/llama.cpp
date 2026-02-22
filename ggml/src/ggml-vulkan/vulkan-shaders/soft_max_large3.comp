@@ -32,17 +32,30 @@ void main() {
         }
     }
 
-    // reduce across the workgroup
-    vals[tid] = max_val;
-    sumsh[tid] = sum;
-    barrier();
-    [[unroll]] for (uint s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            vals[tid] = max(max_val, vals[tid + s]);
-            sumsh[tid] += sumsh[tid + s];
-        }
-        barrier();
+    // reduce both max and sum across the workgroup using subgroup ops (2 barriers)
+    max_val = subgroupMax(max_val);
+    sum = subgroupAdd(sum);
+
+    if (subgroupElect()) {
+        vals[gl_SubgroupID] = max_val;
+        sumsh[gl_SubgroupID] = sum;
     }
+    barrier();
+
+    const uint num_subgroups = gl_NumSubgroups;
+    if (gl_SubgroupID == 0) {
+        FLOAT_TYPE v_max = (gl_SubgroupInvocationID < num_subgroups)
+                         ? vals[gl_SubgroupInvocationID]
+                         : uintBitsToFloat(0xFF800000);
+        FLOAT_TYPE v_sum = (gl_SubgroupInvocationID < num_subgroups)
+                         ? sumsh[gl_SubgroupInvocationID]
+                         : FLOAT_TYPE(0.0f);
+        v_max = subgroupMax(v_max);
+        v_sum = subgroupAdd(v_sum);
+        vals[0] = v_max;
+        sumsh[0] = v_sum;
+    }
+    barrier();
 
     max_val = vals[0];
     sum = sumsh[0];

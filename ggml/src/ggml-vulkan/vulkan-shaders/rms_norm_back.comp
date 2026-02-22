@@ -4,6 +4,8 @@
 #include "types.glsl"
 
 #extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
 #define BLOCK_SIZE 512
 
 layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
@@ -21,26 +23,38 @@ void main() {
 
     // Compute derivative of x[i]/norm(x) = g[i]/norm(x) - x[i] dot(x,g)/KX / norm(x)^1.5
 
-    // partial sums for thread in warp
-    sum_xx[tid] = FLOAT_TYPE(0.0f);
-    sum_xg[tid] = FLOAT_TYPE(0.0f);
+    FLOAT_TYPE pxx = FLOAT_TYPE(0.0f);
+    FLOAT_TYPE pxg = FLOAT_TYPE(0.0f);
 
     [[unroll]] for (uint col = tid; col < p.KX; col += BLOCK_SIZE) {
         const FLOAT_TYPE gi = FLOAT_TYPE(data_a[row*p.KX + col]);
         const FLOAT_TYPE xi = FLOAT_TYPE(data_b[row*p.KX + col]);
-        sum_xx[tid] += xi * xi;
-        sum_xg[tid] += xi * gi;
+        pxx += xi * xi;
+        pxg += xi * gi;
     }
 
-    // sum up partial sums and write back result
-    barrier();
-    [[unroll]] for (int s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            sum_xx[tid] += sum_xx[tid + s];
-            sum_xg[tid] += sum_xg[tid + s];
-        }
-        barrier();
+    // Subgroup-accelerated reduction for both sums (2 barriers vs 10)
+    pxx = subgroupAdd(pxx);
+    pxg = subgroupAdd(pxg);
+
+    if (subgroupElect()) {
+        sum_xx[gl_SubgroupID] = pxx;
+        sum_xg[gl_SubgroupID] = pxg;
     }
+    barrier();
+
+    const uint num_subgroups = gl_NumSubgroups;
+    if (gl_SubgroupID == 0) {
+        FLOAT_TYPE vxx = (gl_SubgroupInvocationID < num_subgroups)
+                       ? sum_xx[gl_SubgroupInvocationID] : FLOAT_TYPE(0.0f);
+        FLOAT_TYPE vxg = (gl_SubgroupInvocationID < num_subgroups)
+                       ? sum_xg[gl_SubgroupInvocationID] : FLOAT_TYPE(0.0f);
+        vxx = subgroupAdd(vxx);
+        vxg = subgroupAdd(vxg);
+        sum_xx[0] = vxx;
+        sum_xg[0] = vxg;
+    }
+    barrier();
 
     const FLOAT_TYPE eps = FLOAT_TYPE(p.param1);
     const FLOAT_TYPE mean = sum_xx[0] / FLOAT_TYPE(p.KX);

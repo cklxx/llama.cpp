@@ -30,6 +30,8 @@ layout (binding = 6) readonly buffer R_I {uvec2 rope_data_i[];}; // indices for 
 #endif
 
 #extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
 #define BLOCK_SIZE 512
 
 layout (constant_id = 1) const bool do_multiply = false;
@@ -37,6 +39,8 @@ layout (constant_id = 1) const bool do_multiply = false;
 layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
 
 shared FLOAT_TYPE sumsh[BLOCK_SIZE];
+
+#include "subgroup_reduce.glsl"
 
 void rms_norm(uint num_iters) {
     const uint ncols     = p.ne00;
@@ -70,17 +74,8 @@ void rms_norm(uint num_iters) {
         sum += xi * xi;
     }
 
-    sumsh[tid] = sum;
-    // sum up partial sums and write back result
-    barrier();
-    [[unroll]] for (int s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            sum += sumsh[tid + s];
-            sumsh[tid] = sum;
-        }
-        barrier();
-    }
-    sum = sumsh[0];
+    // sum up partial sums using subgroup-accelerated reduction (2 barriers vs 10)
+    SUBGROUP_REDUCE_ADD(sum, sumsh);
 
     const FLOAT_TYPE mean = sum / FLOAT_TYPE(ncols);
     const FLOAT_TYPE scale = inversesqrt(mean + FLOAT_TYPE(p.param1));

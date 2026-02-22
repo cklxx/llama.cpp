@@ -31,18 +31,8 @@ void main() {
         }
     }
 
-    // reduce across the workgroup
-    vals[tid] = max_val;
-    barrier();
-    [[unroll]] for (uint s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            vals[tid] = max(max_val, vals[tid + s]);
-        }
-        barrier();
-    }
-
-    max_val = vals[0];
-    barrier();
+    // reduce max across the workgroup using subgroup ops
+    SUBGROUP_REDUCE_MAX(max_val, vals);
 
     FLOAT_TYPE sum = FLOAT_TYPE(0.0f);
 
@@ -62,18 +52,10 @@ void main() {
         data_d[i] = D_TYPE(val);
     }
 
-    // reduce across the workgroup
-    vals[tid] = sum;
-    barrier();
-    [[unroll]] for (uint s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            vals[tid] += vals[tid + s];
-        }
-        barrier();
-    }
+    // reduce sum across the workgroup using subgroup ops
+    SUBGROUP_REDUCE_ADD(sum, vals);
 
     if (tid == 0) {
-        sum = vals[0];
         data_s[rowx * gl_NumWorkGroups.x + gl_WorkGroupID.x] = sum;
     }
 }

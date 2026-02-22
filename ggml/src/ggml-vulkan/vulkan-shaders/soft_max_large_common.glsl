@@ -1,4 +1,6 @@
 #extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
 
 layout (push_constant) uniform parameter
 {
@@ -35,6 +37,8 @@ layout (binding = 4) buffer M {float data_m[];};
 layout (binding = 5) buffer S {float data_s[];};
 
 shared FLOAT_TYPE vals[BLOCK_SIZE];
+
+#include "subgroup_reduce.glsl"
 
 float get_slope(uint rowx) {
     float slope = 1.0f;
