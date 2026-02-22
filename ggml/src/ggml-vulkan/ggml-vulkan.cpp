@@ -3068,6 +3068,16 @@ static void ggml_vk_load_shaders(vk_device& device) {
         if ((device->architecture == AMD_GCN) && (device->driver_id != vk::DriverId::eAmdProprietary)) {
             m_warptile_mmq = m_warptile_mmq_int = { 256, 64, 64, 32, 16, 16, 2, 2, 2, 1, 16 };
             m_warptile_mmqid = m_warptile_mmqid_int = { 256, 64, 64, 32, 16, 16, 2, 2, 2, 1, 16 };
+        } else if (device->vendor_id == VK_VENDOR_ID_AMD && device->uma &&
+                   (device->architecture == AMD_RDNA2 || device->architecture == AMD_RDNA3) &&
+                   device->driver_id != vk::DriverId::eAmdProprietary) {
+            // RDNA iGPU (Ryzen AI) with UMA: favor medium tiles for L2 cache residency.
+            // iGPUs have fewer CUs (4-12) and share L2 with the CPU, so smaller working
+            // sets reduce L2 thrashing. Avoid large tiles that would over-subscribe the
+            // limited compute resources.
+            m_warptile = { 128, 64, 64, 16, subgroup_size_8, 32, 2, tm_m, tn_m, tk_m, subgroup_size_8 };
+            m_warptile_mmq = m_warptile_mmq_int = { 128, 64, 64, 32, subgroup_size_8, 32, 2, tm_m, tn_m, tk_m, subgroup_size_8 };
+            m_warptile_mmq_int_k = { 128, 64, 64, 32, subgroup_size_8, 32, 1, 2, 2, 1, subgroup_size_8 };
         } else if (device->vendor_id == VK_VENDOR_ID_AMD && device->coopmat_support && device->driver_id != vk::DriverId::eAmdProprietary) {
             // This is intentionally using tx_m values, slight performance increase
             l_warptile = { 256, 128, 128, 16, subgroup_size_8, 64, 2, tm_m, tn_m, tk_m, subgroup_size_8 };
@@ -5198,7 +5208,9 @@ static vk_device ggml_vk_get_device(size_t idx) {
             switch (device->vendor_id) {
 #ifndef GGML_VULKAN_RUN_TESTS
             case VK_VENDOR_ID_AMD:
-                device->mul_mat_l[i]    = device->coopmat_support && device->driver_id != vk::DriverId::eAmdProprietary;
+                // Disable large tiles on iGPU (UMA): limited CUs make 128x128 tiles
+                // inefficient due to low occupancy and L2 thrashing
+                device->mul_mat_l[i]    = device->coopmat_support && device->driver_id != vk::DriverId::eAmdProprietary && !device->uma;
                 device->mul_mat_m[i]    = true;
                 device->mul_mat_s[i]    = true;
                 device->mul_mat_id_l[i] = false;

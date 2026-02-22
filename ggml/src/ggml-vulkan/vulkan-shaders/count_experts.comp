@@ -1,6 +1,8 @@
 #version 450
 
 #extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
 
 #include "types.glsl"
 
@@ -20,7 +22,8 @@ layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
 layout (binding = 0) readonly buffer A {uint data_a[];};
 layout (binding = 1) writeonly buffer D {uint data_d[];};
 
-shared uint vals[BLOCK_SIZE];
+// Only need one slot per subgroup instead of per thread
+shared uint partial_sums[BLOCK_SIZE / 32];
 
 void main() {
     const uint expert_id = gl_WorkGroupID.x;
@@ -36,16 +39,26 @@ void main() {
         count += uint(a == expert_id);
     }
 
-    vals[tid] = count;
+    // Phase 1: reduce within each subgroup using subgroup intrinsics (no barriers)
+    count = subgroupAdd(count);
+
+    // Phase 2: one thread per subgroup writes partial sum to shared memory
+    if (subgroupElect()) {
+        partial_sums[gl_SubgroupID] = count;
+    }
+
     barrier();
-    [[unroll]] for (uint s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            vals[tid] += vals[tid + s];
-        }
-        barrier();
+
+    // Phase 3: first subgroup reduces across all subgroup partial sums
+    const uint num_subgroups = BLOCK_SIZE / gl_SubgroupSize;
+    if (gl_SubgroupID == 0) {
+        count = (gl_SubgroupInvocationID < num_subgroups)
+              ? partial_sums[gl_SubgroupInvocationID]
+              : 0;
+        count = subgroupAdd(count);
     }
 
     if (tid == 0) {
-        data_d[expert_id] = vals[0];
+        data_d[expert_id] = count;
     }
 }
