@@ -253,6 +253,7 @@ enum vk_device_architecture {
     AMD_RDNA1,
     AMD_RDNA2,
     AMD_RDNA3,
+    AMD_RDNA4,
     INTEL_XE2,
     NVIDIA_PRE_TURING,
     NVIDIA_TURING,
@@ -300,6 +301,11 @@ static vk_device_architecture get_device_architecture(const vk::PhysicalDevice& 
             // RDNA
             if (shader_core_props_amd.wavefrontsPerSimd == 20) {
                 return vk_device_architecture::AMD_RDNA1;
+            }
+            // RDNA 4 (gfx12 / Navi 48): 4 CUs per WGP, 16 wavefronts per SIMD,
+            // dynamic register allocation, out-of-order memory operations.
+            if (shader_core_props_amd.wavefrontsPerSimd == 16) {
+                return vk_device_architecture::AMD_RDNA4;
             }
             if (integer_dot_props.integerDotProduct4x8BitPackedMixedSignednessAccelerated) {
                 return vk_device_architecture::AMD_RDNA3;
@@ -2915,6 +2921,16 @@ static const std::unordered_map<std::string, uint32_t> rdna3_pipelines = {
     {"argmax", 64}, {"sum_rows", 64}, {"count_equal", 64},
 };
 
+// Pipeline configuration for RDNA4 GPUs (Navi 48 / RX 9070 series).
+// RDNA 4 has 4 CUs per WGP (vs 2 in RDNA 3), out-of-order memory operations,
+// and dynamic register allocation. Wave64 helps reduction-heavy shaders and
+// also benefits from the wider SIMD utilization per WGP.
+static const std::unordered_map<std::string, uint32_t> rdna4_pipelines = {
+    {"soft_max", 64}, {"im2col", 64},
+    {"argmax", 64}, {"sum_rows", 64}, {"count_equal", 64},
+    {"mul_mat_vec", 64},
+};
+
 static constexpr uint32_t RDNA_DEFAULT_SUBGROUP_SIZE = 32;
 
 // Define configurations for different GPUs.
@@ -2937,6 +2953,13 @@ static std::vector<GpuPipelineConfig> gpu_pipeline_configs = {
         vk_device_architecture::AMD_RDNA3,
         {
             rdna3_pipelines,
+        },
+        RDNA_DEFAULT_SUBGROUP_SIZE
+    },
+    {
+        vk_device_architecture::AMD_RDNA4,
+        {
+            rdna4_pipelines,
         },
         RDNA_DEFAULT_SUBGROUP_SIZE
     },
@@ -3086,14 +3109,38 @@ static void ggml_vk_load_shaders(vk_device& device) {
             m_warptile_mmqid = m_warptile_mmqid_int = { 256, 64, 64, 32, 16, 16, 2, 2, 2, 1, 16 };
         } else if (device->vendor_id == VK_VENDOR_ID_AMD && device->uma &&
                    (device->architecture == AMD_RDNA2 || device->architecture == AMD_RDNA3) &&
+                   device->shader_core_count <= 16 &&
                    device->driver_id != vk::DriverId::eAmdProprietary) {
-            // RDNA iGPU (Ryzen AI) with UMA: favor medium tiles for L2 cache residency.
-            // iGPUs have fewer CUs (4-12) and share L2 with the CPU, so smaller working
-            // sets reduce L2 thrashing. Avoid large tiles that would over-subscribe the
-            // limited compute resources.
+            // Small RDNA iGPU with UMA (4-16 CUs): favor medium tiles for L2 cache
+            // residency. Few CUs share L2 with the CPU, so smaller working sets reduce
+            // L2 thrashing. Avoid large tiles that would over-subscribe the limited
+            // compute resources.
             m_warptile = { 128, 64, 64, 16, subgroup_size_8, 32, 2, tm_m, tn_m, tk_m, subgroup_size_8 };
             m_warptile_mmq = m_warptile_mmq_int = { 128, 64, 64, 32, subgroup_size_8, 32, 2, tm_m, tn_m, tk_m, subgroup_size_8 };
             m_warptile_mmq_int_k = { 128, 64, 64, 32, subgroup_size_8, 32, 1, 2, 2, 1, subgroup_size_8 };
+        } else if (device->vendor_id == VK_VENDOR_ID_AMD && device->uma &&
+                   (device->architecture == AMD_RDNA3) &&
+                   device->shader_core_count > 16 &&
+                   device->driver_id != vk::DriverId::eAmdProprietary) {
+            // Large RDNA 3.5 iGPU (e.g. Radeon 8060S in Ryzen AI MAX 395, 40 CUs):
+            // UMA with high bandwidth LPDDR5X. Enough CUs to benefit from medium-large
+            // tiles. Use 128x128 tiles which fit well in the shared L2 while keeping
+            // occupancy high across the many CUs.
+            l_warptile = { 256, 128, 128, 16, subgroup_size_8, 64, 2, tm_m, tn_m, tk_m, subgroup_size_8 };
+            l_warptile_mmq = l_warptile_mmq_int = { 256, 128, 128, 32, subgroup_size_8, 64, 2, tm_m, tn_m, tk_m, subgroup_size_8 };
+            l_warptile_mmq_int_k = { 256, 128, 128, 32, subgroup_size_16, 64, 1, 4, 2, 1, subgroup_size_16 };
+            // Medium tiles tuned for UMA bandwidth
+            m_warptile = { 128, 64, 64, 16, subgroup_size_8, 32, 2, tm_m, tn_m, tk_m, subgroup_size_8 };
+            m_warptile_mmq = m_warptile_mmq_int = { 128, 64, 64, 32, subgroup_size_8, 32, 2, tm_m, tn_m, tk_m, subgroup_size_8 };
+            m_warptile_mmq_int_k = { 128, 64, 64, 32, subgroup_size_8, 32, 1, 2, 2, 1, subgroup_size_8 };
+        } else if (device->vendor_id == VK_VENDOR_ID_AMD && device->architecture == AMD_RDNA4 &&
+                   device->driver_id != vk::DriverId::eAmdProprietary) {
+            // RDNA 4 (Navi 48 / RX 9070 series): 4 CUs per WGP, out-of-order memory,
+            // dynamic register allocation, 8 MB L2 cache. Larger L2 allows bigger BK
+            // without thrashing, and out-of-order memory helps hide latency in split-K.
+            l_warptile = { 256, 128, 128, 16, subgroup_size_8, 64, 2, tm_m, tn_m, tk_m, subgroup_size_8 };
+            l_warptile_mmq = l_warptile_mmq_int = { 256, 128, 128, 32, subgroup_size_8, 64, 2, tm_m, tn_m, tk_m, subgroup_size_8 };
+            l_warptile_mmq_int_k = { 256, 128, 128, 32, subgroup_size_16, 64, 1, 4, 2, 1, subgroup_size_16 };
         } else if (device->vendor_id == VK_VENDOR_ID_AMD && device->coopmat_support && device->driver_id != vk::DriverId::eAmdProprietary) {
             // This is intentionally using tx_m values, slight performance increase
             l_warptile = { 256, 128, 128, 16, subgroup_size_8, 64, 2, tm_m, tn_m, tk_m, subgroup_size_8 };
@@ -5224,9 +5271,12 @@ static vk_device ggml_vk_get_device(size_t idx) {
             switch (device->vendor_id) {
 #ifndef GGML_VULKAN_RUN_TESTS
             case VK_VENDOR_ID_AMD:
-                // Disable large tiles on iGPU (UMA): limited CUs make 128x128 tiles
-                // inefficient due to low occupancy and L2 thrashing
-                device->mul_mat_l[i]    = device->coopmat_support && device->driver_id != vk::DriverId::eAmdProprietary && !device->uma;
+                // Enable large tiles for dGPUs with coopmat, and also for large iGPUs
+                // (e.g. Radeon 8060S in Ryzen AI MAX 395 with 40 CUs).
+                // Small iGPUs (<=16 CUs) skip large tiles: limited CUs make 128x128
+                // tiles inefficient due to low occupancy and L2 thrashing.
+                device->mul_mat_l[i]    = device->coopmat_support && device->driver_id != vk::DriverId::eAmdProprietary &&
+                                          (!device->uma || device->shader_core_count > 16);
                 device->mul_mat_m[i]    = true;
                 device->mul_mat_s[i]    = true;
                 device->mul_mat_id_l[i] = false;
@@ -15438,7 +15488,7 @@ static bool ggml_vk_khr_cooperative_matrix_support(const vk::PhysicalDevicePrope
     case VK_VENDOR_ID_AMD:
         if (driver_props.driverID == vk::DriverId::eAmdProprietary || driver_props.driverID == vk::DriverId::eAmdOpenSource) {
             // Workaround for AMD proprietary driver reporting support on all GPUs
-            return arch == vk_device_architecture::AMD_RDNA3;
+            return arch == vk_device_architecture::AMD_RDNA3 || arch == vk_device_architecture::AMD_RDNA4;
         }
         return true;
     default:
