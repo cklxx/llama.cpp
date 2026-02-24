@@ -1,102 +1,105 @@
-# Vulkan RDNA iGPU Optimization - Test & Comparison Plan
-
-## Overview
-
-This document describes the testing methodology for evaluating the Vulkan
-backend optimizations targeting AMD RDNA iGPUs (Ryzen AI). The changes span
-four commits:
-
-1. **Baseline optimizations**: RDNA iGPU tile tuning, UMA-aware matmul config
-2. **Subgroup reductions (Phase 1)**: Replace shared-memory tree reductions with
-   `subgroupAdd`/`subgroupMax` in 14 shaders (norm, soft_max, argmax, etc.)
-3. **RDNA3 pipeline config**: Wave64 for reduction shaders, subgroup_reduce.glsl
-   helper library
-4. **Subgroup reductions (Phase 2)**: `count_equal` atomic reduction,
-   `mul_mat_vec` cross-subgroup reduction, extended RDNA2/RDNA3 pipeline configs
+# Vulkan Optimization Test Plan — AMD Ryzen AI MAX+ 395
 
 ## Target Hardware
 
-| Device | Architecture | CUs | Subgroup Size | UMA | Notes |
-|--------|-------------|-----|---------------|-----|-------|
-| Ryzen AI 9 HX 370 (Radeon 890M) | RDNA 3.5 | 16 | 32/64 | Yes | Primary target |
-| Ryzen 7 8845HS (Radeon 780M) | RDNA 3 | 12 | 32/64 | Yes | Primary target |
-| Ryzen 7 7840U (Radeon 780M) | RDNA 3 | 12 | 32/64 | Yes | Primary target |
-| Ryzen 5 7640U (Radeon 760M) | RDNA 3 | 8 | 32/64 | Yes | Budget iGPU |
-| Ryzen 7 6800U (Radeon 680M) | RDNA 2 | 12 | 32/64 | Yes | Previous gen |
-| Discrete: RX 7900 XTX | RDNA 3 | 96 | 32/64 | No | Regression check |
-| Discrete: RX 6800 XT | RDNA 2 | 72 | 32/64 | No | Regression check |
+| Spec | Value |
+|------|-------|
+| CPU | AMD Ryzen AI MAX+ 395 |
+| iGPU | Radeon 8060S (RDNA 3.5, gfx1151) |
+| Compute Units | 40 CU (20 WGP) |
+| Memory | LPDDR5X-8000, 256-bit, up to 128 GB |
+| GPU VRAM (configurable) | Up to 96 GB (shared UMA) |
+| Memory Bandwidth | ~256 GB/s theoretical, ~212 GB/s measured |
+| Infinity Cache | 32 MB |
+| L2 Cache | 2 MB |
+| Subgroup Size (RADV) | 64 |
+| Vulkan Device ID | `0x1586` |
+| Driver String | `Radeon 8060S Graphics (RADV GFX1151)` |
 
 ## Prerequisites
 
 ### Software
-- Vulkan SDK >= 1.3 (with `VK_KHR_shader_subgroup_arithmetic` support)
-- RADV (Mesa) driver >= 24.0 or AMDVLK >= 2024.Q1
-- Python 3.8+ with `GitPython` and `tabulate` (`pip install GitPython tabulate`)
 
-### Models (recommended test set)
+- Linux with Vulkan support (kernel >= 6.8 recommended for Strix Halo)
+- Mesa RADV >= 24.3 (for gfx1151 support and `VK_KHR_cooperative_matrix`)
+- Vulkan SDK >= 1.3
+- CMake >= 3.21
+- C++17 compiler (GCC >= 11 or Clang >= 14)
 
-| Model | Size | Quant | Use Case |
-|-------|------|-------|----------|
-| Qwen2.5-0.5B | ~0.4 GB | Q4_0 | Fast smoke test |
-| Llama-3.2-1B | ~0.7 GB | Q4_0 | Small model baseline |
-| Llama-3.2-3B | ~1.8 GB | Q4_K_M | Medium model, fits iGPU VRAM |
-| Phi-3-mini-4k (3.8B) | ~2.2 GB | Q4_K_M | Common iGPU workload |
-| Llama-3.1-8B | ~4.6 GB | Q4_K_M | Large model stress test |
-| Mistral-7B-v0.3 | ~4.1 GB | Q4_K_M | Alternative architecture |
-
-## Test Procedure
-
-### Step 1: Build Baseline and Optimized Versions
+### Verify GPU Detection
 
 ```bash
-# Baseline: build from parent of first optimization commit
-git checkout <parent-of-first-commit>
+vulkaninfo --summary 2>/dev/null | grep -E "deviceName|driverVersion|apiVersion"
+```
+
+Expected output (approximately):
+```
+deviceName    = Radeon 8060S Graphics (RADV GFX1151)
+driverVersion = 24.x.x (or newer)
+apiVersion    = 1.3.x (or newer)
+```
+
+### Models
+
+With up to 96 GB GPU VRAM, this system can run large models fully offloaded.
+Choose models appropriate for your VRAM allocation.
+
+| Model | Size | Quant | Purpose |
+|-------|------|-------|---------|
+| Qwen2.5-0.5B | ~0.4 GB | Q4_0 | Quick smoke test |
+| Llama-3.2-3B | ~1.8 GB | Q4_K_M | Medium baseline |
+| Llama-3.1-8B | ~4.6 GB | Q4_K_M | Typical workload |
+| Qwen2.5-32B | ~18 GB | Q4_K_M | Large model (if VRAM allows) |
+| Llama-3.1-70B | ~40 GB | Q4_K_M | Stress test (needs ~48 GB VRAM) |
+
+## Build
+
+```bash
+# Baseline: build from upstream main (parent of optimization commits)
+git checkout 3571565  # upstream main before our changes
 cmake -B build-baseline -DGGML_VULKAN=ON -DCMAKE_BUILD_TYPE=Release
 cmake --build build-baseline --config Release -j$(nproc)
 
-# Optimized: build from branch head
+# Optimized: build from our branch
 git checkout claude/vulkan-ryzen-ai-optimization-Sl23N
 cmake -B build-opt -DGGML_VULKAN=ON -DCMAKE_BUILD_TYPE=Release
 cmake --build build-opt --config Release -j$(nproc)
 ```
 
-### Step 2: Operator-Level Benchmarks (test-backend-ops)
+## Test 1: Correctness
 
-This validates individual kernel performance and correctness.
+Run the full backend ops test suite to ensure no regressions:
+
+```bash
+./build-opt/bin/test-backend-ops -b Vulkan0 test 2>&1 | tee correctness.txt
+grep -c "FAIL" correctness.txt  # Must be 0
+```
+
+## Test 2: Operator-Level Performance (test-backend-ops)
+
+Compare per-kernel performance between baseline and optimized builds.
 
 ```bash
 # Baseline
 ./build-baseline/bin/test-backend-ops -b Vulkan0 perf \
     -o SOFT_MAX,RMS_NORM,NORM,GROUP_NORM,L2_NORM,MUL_MAT,SUM_ROWS,ARGMAX,COUNT_EQUAL \
-    2>&1 | tee baseline-ops.txt
+    --output baseline-ops.sqlite
 
 # Optimized
 ./build-opt/bin/test-backend-ops -b Vulkan0 perf \
     -o SOFT_MAX,RMS_NORM,NORM,GROUP_NORM,L2_NORM,MUL_MAT,SUM_ROWS,ARGMAX,COUNT_EQUAL \
-    2>&1 | tee optimized-ops.txt
-```
-
-**Database mode** (for automated comparison):
-```bash
-./build-baseline/bin/test-backend-ops -b Vulkan0 perf \
-    -o SOFT_MAX,RMS_NORM,NORM,GROUP_NORM,L2_NORM,MUL_MAT,SUM_ROWS,ARGMAX,COUNT_EQUAL \
-    --output baseline-ops.sqlite
-
-./build-opt/bin/test-backend-ops -b Vulkan0 perf \
-    -o SOFT_MAX,RMS_NORM,NORM,GROUP_NORM,L2_NORM,MUL_MAT,SUM_ROWS,ARGMAX,COUNT_EQUAL \
     --output optimized-ops.sqlite
 
+# Compare
 python3 scripts/compare-llama-bench.py \
     -t test-backend-ops \
     baseline-ops.sqlite optimized-ops.sqlite
 ```
 
-**Key metrics**: `time_us`, `flops`, `bandwidth_gb_s`
+### Expected Improvements
 
-**Expected improvements for optimized ops**:
-
-| Operation | Mechanism | Expected Speedup |
-|-----------|-----------|-----------------|
+| Operation | Change | Expected Speedup |
+|-----------|--------|-----------------|
 | SOFT_MAX | Subgroup reduction + wave64 | 10-30% |
 | RMS_NORM | Subgroup reduction (2 barriers vs 10) | 15-40% |
 | NORM | Subgroup vec2 reduction | 15-40% |
@@ -106,11 +109,13 @@ python3 scripts/compare-llama-bench.py \
 | ARGMAX | Subgroup max + ballot + wave64 | 20-40% |
 | COUNT_EQUAL | Subgroup atomic reduction | 5-15% |
 | MUL_MAT (vec) | Cross-subgroup subgroupAdd | 5-15% |
+| MUL_MAT (large) | 128x128 tile tuning for 40 CU iGPU | 5-20% |
 
-### Step 3: End-to-End Inference Benchmarks (llama-bench)
+## Test 3: End-to-End Inference (llama-bench)
+
+### Prompt Processing (prefill)
 
 ```bash
-# Prompt processing (prefill) - tests MUL_MAT heavy path
 ./build-baseline/bin/llama-bench \
     -m <model.gguf> -ngl 99 \
     -p 512 -n 0 -r 5 \
@@ -120,8 +125,11 @@ python3 scripts/compare-llama-bench.py \
     -m <model.gguf> -ngl 99 \
     -p 512 -n 0 -r 5 \
     --output optimized-pp.sqlite
+```
 
-# Token generation (decode) - tests MUL_MAT_VEC + SOFT_MAX + RMS_NORM path
+### Token Generation (decode)
+
+```bash
 ./build-baseline/bin/llama-bench \
     -m <model.gguf> -ngl 99 \
     -p 0 -n 128 -r 5 \
@@ -131,16 +139,20 @@ python3 scripts/compare-llama-bench.py \
     -m <model.gguf> -ngl 99 \
     -p 0 -n 128 -r 5 \
     --output optimized-tg.sqlite
+```
 
-# Compare results
+### Compare
+
+```bash
 python3 scripts/compare-llama-bench.py \
     baseline-pp.sqlite baseline-tg.sqlite \
     optimized-pp.sqlite optimized-tg.sqlite
 ```
 
-**Sweep across models and batch sizes**:
+### Model Sweep
+
 ```bash
-for MODEL in qwen2.5-0.5b-q4_0.gguf llama-3.2-1b-q4_0.gguf llama-3.2-3b-q4_k_m.gguf phi-3-mini-q4_k_m.gguf; do
+for MODEL in qwen2.5-0.5b-q4_0.gguf llama-3.2-3b-q4_k_m.gguf llama-3.1-8b-q4_k_m.gguf; do
     for NP in 128 512 2048; do
         for NG in 32 128; do
             echo "=== $MODEL pp=$NP tg=$NG ==="
@@ -150,122 +162,60 @@ for MODEL in qwen2.5-0.5b-q4_0.gguf llama-3.2-1b-q4_0.gguf llama-3.2-3b-q4_k_m.g
 done
 ```
 
-### Step 4: Correctness Validation
+## Test 4: Perplexity (optional)
 
-Ensure no numerical regressions:
-
-```bash
-# Full backend ops correctness tests
-./build-opt/bin/test-backend-ops -b Vulkan0 test 2>&1 | tee correctness.txt
-
-# Check for failures
-grep -c "FAIL" correctness.txt  # Should be 0
-
-# Perplexity comparison (optional, thorough)
-./build-baseline/bin/llama-perplexity -m <model.gguf> -ngl 99 -f wikitext-2-raw/wiki.test.raw \
-    --chunks 32 2>&1 | tee baseline-ppl.txt
-./build-opt/bin/llama-perplexity -m <model.gguf> -ngl 99 -f wikitext-2-raw/wiki.test.raw \
-    --chunks 32 2>&1 | tee optimized-ppl.txt
-# Perplexity values should be identical or within floating-point tolerance (<0.01 difference)
-```
-
-### Step 5: Regression Testing on Discrete GPUs
-
-Run on a discrete RDNA2/RDNA3 GPU to ensure no regressions:
+Verify numerical accuracy has not degraded:
 
 ```bash
-# Discrete GPU test
-./build-opt/bin/test-backend-ops -b Vulkan0 test
-./build-opt/bin/llama-bench -m llama-3.2-3b-q4_k_m.gguf -ngl 99 -p 512 -n 128 -r 5
+./build-baseline/bin/llama-perplexity -m <model.gguf> -ngl 99 \
+    -f wikitext-2-raw/wiki.test.raw --chunks 32 2>&1 | tee baseline-ppl.txt
+
+./build-opt/bin/llama-perplexity -m <model.gguf> -ngl 99 \
+    -f wikitext-2-raw/wiki.test.raw --chunks 32 2>&1 | tee optimized-ppl.txt
 ```
 
-Compare against baseline to confirm no performance degradation on discrete.
+Perplexity difference should be < 0.01.
 
-### Step 6: Multi-Driver Validation
+## Results Template
 
-If available, test with multiple Vulkan drivers:
+### Operator-Level
 
-```bash
-# RADV (Mesa open-source)
-VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.x86_64.json \
-    ./build-opt/bin/test-backend-ops -b Vulkan0 test
+| Op | Params | Baseline (us) | Optimized (us) | Speedup |
+|----|--------|---------------|----------------|---------|
+| RMS_NORM | [4096] | | | |
+| RMS_NORM | [8192] | | | |
+| SOFT_MAX | [4096,1,32] | | | |
+| SOFT_MAX | [4096,1,128] | | | |
+| NORM | [4096] | | | |
+| GROUP_NORM | [4096,32] | | | |
+| L2_NORM | [4096] | | | |
+| SUM_ROWS | [4096] | | | |
+| ARGMAX | [32000] | | | |
+| COUNT_EQUAL | [32000] | | | |
+| MUL_MAT | [4096,4096,1] | | | |
+| MUL_MAT | [4096,11008,1] | | | |
 
-# AMDVLK (AMD proprietary)
-VK_ICD_FILENAMES=/etc/vulkan/icd.d/amd_icd64.json \
-    ./build-opt/bin/test-backend-ops -b Vulkan0 test
-```
-
-## Metrics Collection Template
-
-### Per-Operation Results Table
-
-| Op | Params | Baseline (us) | Optimized (us) | Speedup | Notes |
-|----|--------|---------------|----------------|---------|-------|
-| RMS_NORM | [4096] | | | | |
-| RMS_NORM | [8192] | | | | |
-| SOFT_MAX | [4096,1,32] | | | | |
-| SOFT_MAX | [4096,1,128] | | | | |
-| NORM | [4096] | | | | |
-| GROUP_NORM | [4096,32] | | | | |
-| L2_NORM | [4096] | | | | |
-| SUM_ROWS | [4096] | | | | |
-| ARGMAX | [32000] | | | | |
-| COUNT_EQUAL | [32000] | | | | |
-| MUL_MAT | [4096,4096,1] | | | | |
-| MUL_MAT | [4096,11008,1] | | | | |
-
-### End-to-End Results Table
+### End-to-End
 
 | Model | Quant | pp512 base (t/s) | pp512 opt (t/s) | tg128 base (t/s) | tg128 opt (t/s) | pp Speedup | tg Speedup |
 |-------|-------|-------------------|------------------|-------------------|------------------|-----------|-----------|
 | Qwen2.5-0.5B | Q4_0 | | | | | | |
-| Llama-3.2-1B | Q4_0 | | | | | | |
 | Llama-3.2-3B | Q4_K_M | | | | | | |
-| Phi-3-mini | Q4_K_M | | | | | | |
 | Llama-3.1-8B | Q4_K_M | | | | | | |
 
-## What to Report
+## Environment Info to Report
 
-When reporting results, include:
+```bash
+# GPU info
+vulkaninfo --summary 2>/dev/null | grep -E "deviceName|driverVersion|apiVersion"
 
-1. **Hardware**: CPU model, iGPU model, total system RAM, Vulkan driver version
-   ```bash
-   vulkaninfo --summary 2>/dev/null | grep -E "deviceName|driverVersion|apiVersion"
-   ```
-2. **Software**: Mesa/AMDVLK version, kernel version, llama.cpp commit hashes
-3. **Operator-level**: Table with per-op speedups (test-backend-ops perf)
-4. **End-to-end**: Table with tokens/sec for prompt processing and generation
-5. **Correctness**: Pass/fail status of test-backend-ops, perplexity delta
+# System info
+uname -r
+cat /etc/os-release | head -3
 
-## Optimization Summary
+# VRAM allocation
+cat /sys/class/drm/card*/device/mem_info_vram_total 2>/dev/null
 
-### Changes Made
-
-| File | Change | Rationale |
-|------|--------|-----------|
-| `ggml-vulkan.cpp` | RDNA iGPU tile tuning (m_warptile) | Smaller tiles for L2 residency on 4-12 CU iGPUs |
-| `ggml-vulkan.cpp` | RDNA2/3 pipeline wave64 configs | Wider subgroups for reduction-heavy kernels |
-| `subgroup_reduce.glsl` | New shared helper library | Reusable 2-phase subgroup reduction macros |
-| `soft_max*.comp` | Subgroup reduction | 2 barriers vs log2(N)+1 |
-| `norm.comp` | Subgroup vec2 reduction | 2 barriers vs 10 |
-| `rms_norm.comp` | Subgroup reduction | 2 barriers vs 10 |
-| `rms_norm_back.comp` | Subgroup reduction | 2 barriers vs 10 |
-| `group_norm.comp` | Subgroup reduction | 2 barriers vs log2(N)+1 |
-| `l2_norm.comp` | Subgroup reduction | 2 barriers vs 10 |
-| `sum_rows.comp` | Subgroup reduction | 2 barriers vs log2(N)+1 |
-| `argmax.comp` | Subgroup max+ballot | 2 barriers vs log2(N)+1 |
-| `count_experts.comp` | Subgroup reduction | 2 barriers vs log2(N)+1 |
-| `count_equal.comp` | Subgroup atomic reduction | N atomics → N/subgroup_size |
-| `mul_mat_vec_nc.comp` | Subgroup + vec4 loads | Vectorized memory + single subgroupAdd |
-| `mul_mat_vec_base.glsl` | Cross-subgroup subgroupAdd | Replace serial loop with hardware reduction |
-
-### Why Subgroup Ops Help on RDNA
-
-1. **Hardware-accelerated**: `subgroupAdd`/`subgroupMax` map directly to RDNA's
-   DPP (Data Parallel Primitives) and cross-lane instructions
-2. **Zero extra barriers**: Intra-subgroup phase needs no synchronization
-3. **Fewer shared memory accesses**: Only subgroup leaders write partial results
-4. **Wave64 amplification**: On RDNA, wave64 mode doubles the lanes covered per
-   subgroup intrinsic, halving the cross-subgroup partial count
-5. **Better occupancy on iGPU**: Fewer barriers means less warp stall time,
-   which matters when CU count is low (4-12 on iGPU vs 60-96 on discrete)
+# llama.cpp version
+git log --oneline -1
+```
